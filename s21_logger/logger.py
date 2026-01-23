@@ -12,8 +12,8 @@ class LogLevel(IntEnum):
     info = 2
     warn = 3
     err = 4
-    fatal = 5
-    success = 6
+    fatal = 6
+    success = 5
 
     def __str__(self):
         labels = {
@@ -28,17 +28,28 @@ class LogLevel(IntEnum):
 
 
 class Logger:
-    loglevel: LogLevel
-    stdout: TextIO
-    name:str
-    quiet: bool
-
     def __init__(self, name:str, out: TextIO = sys.stdout, loglevel: LogLevel = LogLevel.success, verbose: bool = False, quiet:bool = True) -> None:
-        self.stdout = out
+        self.file = False
+        if isinstance(out, str):
+            try:
+                self.stdout = open(out, "a", encoding="utf-8", errors="replace")
+            except FileNotFoundError:
+                temp = open(out, "w", encoding="utf-8", errors="replace")
+                temp.close()
+                del temp
+                self.stdout = open(out, "a", encoding="utf-8", errors="replace")
+            self.file = True
+        else:
+            self.stdout = out
         self.loglevel = loglevel
         self.verbose = verbose
         self.name = name
         self.quiet = quiet
+
+    def close(self):
+        if self.file:
+            print("result written on file")
+            self.stdout.close()
     
     def set_level(self, level:str):
         match level:
@@ -80,7 +91,7 @@ class Logger:
 
     def log_exception(self, exc_type, exc_value, exc_tb, status: LogLevel = LogLevel.err) -> None:
         short, full_tb = self._format_exc_summary(exc_type, exc_value, exc_tb)
-        header = f"{__name__} {self._now()} - {status.value} - Uncaught exception: {short}"
+        header = f"{__name__} {self._now()} - {status} - Uncaught exception: {short}"
         self.stdout.write(header + "\n")
         if self.verbose:
             self.stdout.write(full_tb)
