@@ -358,8 +358,8 @@ async def run_requester(
                         if not url:
                             continue
                         if target_https:
-                            trace_config.star_vars[url].is_https = True
-                        coros.append(fetch_and_process(session, trace_config.star_vars[url], url, logger, action, timeout, payload, retryes, verbose))
+                            trace_config.star_vars[f"worker-{worker_id} - {url}"].is_https = True
+                        coros.append(fetch_and_process(session, trace_config.star_vars[f"worker-{worker_id} - {url}"], url, logger, action, timeout, payload, retryes, verbose))
                         processed += 1
                     await asyncio.gather(*coros, return_exceptions=True)
                     
