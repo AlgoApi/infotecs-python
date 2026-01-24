@@ -7,7 +7,7 @@ class FakeLogger:
     def __init__(self):
         self.records = []
 
-    def log(self, message: str, level=None):
+    def log(self, message: str, level=None, force_quiet:bool = False):
         self.records.append((level, message))
 
     def last(self):
@@ -210,15 +210,12 @@ async def test_run_requester_with_urls_list(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "fetch_and_process", fake_fetch)
 
     logger = FakeLogger()
-    debug_trace = main.DebugTrace(logger)
-    debug_trace.init_trace()
-    middlewares = []
+
+    debug_trace = main.Log_DebugTrace()
 
     await main.run_requester(
         path=None,
         manual_hosts=items,
-        middlewares=middlewares,
-        trace_config=debug_trace,
         logger=logger,
         payload=None,
         timeout_val=1,
@@ -228,8 +225,11 @@ async def test_run_requester_with_urls_list(monkeypatch, tmp_path):
         qsize=4,
         retryes=1,
         verbose=False,
-        target_https=False
+        target_https=False,
+        debug_trace=debug_trace
     )
 
-    total = sum(v.total for v in debug_trace.star_vars.values())
+    result_debug_trace = debug_trace.get_buf()
+    total = "".join(result_debug_trace).count("::: Success :::")
+    print(result_debug_trace)
     assert total == len(items)

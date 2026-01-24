@@ -69,12 +69,12 @@ class Logger:
     def _now(self) -> str:
         return dt.now().strftime("%d.%m.%Y %H:%M:%S")
 
-    def log(self, message: str, status: LogLevel) -> None:
+    def log(self, message: str, status: LogLevel, force_quiet:bool = False) -> None:
         if status >= self.loglevel:
-            if not self.quiet:
-                self.stdout.write(f"{self.name} {self._now()} - {status} - '{message}'\n")
-            else:
+            if self.quiet or force_quiet:
                 self.stdout.write(f"{message}\n")
+            else:
+                self.stdout.write(f"{self._now()} {self.name} - {status} - {message}\n")
             self.stdout.flush()
 
     def _format_exc_summary(self, exc_type, exc_value, exc_tb) -> Tuple[str, str]:
@@ -91,7 +91,7 @@ class Logger:
 
     def log_exception(self, exc_type, exc_value, exc_tb, status: LogLevel = LogLevel.err) -> None:
         short, full_tb = self._format_exc_summary(exc_type, exc_value, exc_tb)
-        header = f"{__name__} {self._now()} - {status} - Uncaught exception: {short}"
+        header = f"{self._now()} {__name__} - {status} - Uncaught exception: {short}"
         self.stdout.write(header + "\n")
         if self.verbose:
             self.stdout.write(full_tb)

@@ -14,11 +14,14 @@ import os
 import platform
 import json
 import itertools
-from typing import Optional, Callable, Dict, List, Any
+from typing import Optional, Callable, Dict, List, Any, TextIO
 from aiohttp import TraceConfig, ClientRequest, ClientResponse, ClientSession
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import get_context as mp_get_context
+import os
 
 MAX_WORKERS_LIMIT = 100
-BATCH_SIZE = 50
+BATCH_SIZE = 2
 
 @dataclass
 class RequestStats:
@@ -42,6 +45,18 @@ class RequestStats:
         return min(self.durations) if self.durations else 0.0
     def get_max(self) -> float:
         return max(self.durations) if self.durations else 0.0
+
+@dataclass
+class Log_DebugTrace():
+    log_buf: list[str] = field(default_factory=list)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def add_log(self, data:str):
+        async with self.lock:
+            self.log_buf.append(data)
+
+    def get_buf(self):
+        return self.log_buf
     
 class DebugTrace():
     def __init__(self, logger_obj: Logger) -> None:
@@ -204,7 +219,7 @@ async def fetch_and_process(session: ClientSession,
             action_func = await get_action(session, url, action)
             async with action_func(url, allow_redirects=True, timeout=timeout, json=payload, trace_request_ctx={'stats': stats}) as resp:
                 try:
-                    logger.log(f"response: {(await resp.read()).decode('utf-8')[:50]} for {url}", LogLevel.debug)
+                    logger.log(f"response: {(await resp.read()).decode('utf-8')[:50].replace("\n", "")} for {url}", LogLevel.debug)
                 except Exception:
                     logger.log(f"binary response for {url}", LogLevel.debug)
         except (InvalidURL, NonHttpUrlClientError) as e:
@@ -274,7 +289,9 @@ async def fetch_and_process(session: ClientSession,
     logger.log("\n{"+f"\n    Host={stats.url}\n    Success={success}\n    Failed={failed}\n    Errors={stats.errors}\n    Min={stats.get_min():.4f}\n    Max={stats.get_max():.4f}\n    Avg={stats.avg_time():.4f}\n" + "}", LogLevel.success)
     del stats
 
-def _produce_batches_sync(path: str|None, items: list[str]|None, batch_size: int, queue_put: Callable[[Optional[List[str]]], None], num_workers: int):
+def _produce_batches_sync(path: str|None, items: list[str]|None, 
+                          batch_size: int, queue_put: Callable[[Optional[List[str]]], None], 
+                          num_workers: int):
     if items is not None:
         it = iter(items)
 
@@ -296,25 +313,93 @@ def _produce_batches_sync(path: str|None, items: list[str]|None, batch_size: int
         for _ in range(num_workers):
             queue_put(None)
 
+def _process_batch_in_subprocess(batch: list, action: str, payload: dict | None,
+                                 timeout_val: int, conn_limit: int = 50, worker_id: int = 0,
+                                 target_https: bool = False, retryes: int = 1, verbose: bool = False,
+                                 headers: dict[str, str]|None = None, cookies: dict[str, str]|None = None,
+                                 bearer: str|None = None, cli_pass: bool = False, file_pass: str|None = None,
+                                 login: str|None = None, force: bool = False) -> List[str]:
+    _buf: List[str] = []
+
+    class _BufferWriter:
+        def write(self, s):
+            _buf.append(str(s))
+        def flush(self):
+            pass
+
+    async def worker(batch):
+        logger = Logger(out=_BufferWriter(), verbose=verbose, loglevel=LogLevel.debug, name=__name__, quiet=False) # pyright: ignore[reportArgumentType] fake log to stream
+        connector = TCPConnector(limit=conn_limit, force_close=True)
+        timeout = ClientTimeout(total=timeout_val, connect=None, sock_connect=timeout_val, sock_read=timeout_val)
+        
+        middlewares = list()
+        if headers:
+            middlewares.append(headers_middleware(headers))
+        if cookies:
+            middlewares.append(cookies_middleware(cookies))
+        if bearer:
+            middlewares.append(bearer_auth_middleware(bearer))
+        elif cli_pass and login:
+            middlewares.append(pass_auth_middleware(login, None, logger))
+        elif file_pass and login:
+            middlewares.append(pass_auth_middleware(login, Path(file_pass), logger, force))
+
+        logger.log(f"worker {worker_id} started", LogLevel.debug)
+        trace_config = DebugTrace(logger)
+        trace_config.init_trace()
+        processed = 0
+        async with ClientSession(connector=connector, middlewares=middlewares, trace_configs=[trace_config.trace], timeout=timeout) as session:
+            if batch is None:
+                return [""]
+            coros = list()
+            url:str
+            for url in batch:
+                url = url.strip()
+                if not url:
+                    continue
+                if target_https:
+                    trace_config.star_vars[f"worker-{worker_id}{url}"].is_https = True
+                coros.append(fetch_and_process(session, trace_config.star_vars[f"worker-{worker_id}{url}"], url, logger, action, timeout, payload, retryes, verbose))
+                processed += 1
+            await asyncio.gather(*coros, return_exceptions=True)
+            logger.log(f"worker {worker_id} finished, processed={processed}", LogLevel.debug)
+        return _buf
+
+    return asyncio.run(worker(batch))
+
+async def parse_log(proc_res: List[str], logger: Logger, quiet: bool, debug_trace: Log_DebugTrace|None=None):
+    log_loglevel = LogLevel.err
+    line:str
+    for line in proc_res:
+        if debug_trace:
+            await debug_trace.add_log(line)
+        if "DEBUG" in line:
+            log_loglevel = LogLevel.debug
+        elif "INFO" in line:
+            log_loglevel = LogLevel.info
+        elif "WARN" in line:
+            log_loglevel = LogLevel.warn
+        elif "ERROR" in line:
+            log_loglevel = LogLevel.err
+        elif "FATAL" in line:
+            log_loglevel = LogLevel.fatal
+        elif "Success" in line:
+            log_loglevel = LogLevel.success
+        line = line.rstrip('\n')
+        if quiet:
+            line = "".join(line.split(" - ")[2:])
+        logger.log(line, log_loglevel, True)
+    return debug_trace
+
 async def run_requester(
-    path: str|None,
-    manual_hosts: List[str]|None,
-    middlewares: List[Callable],
-    trace_config: DebugTrace,
-    logger: Logger,
-    payload: dict|None,
-    timeout_val: int = 3,
-    action: str = "get",
-    batch_size: int = 5,
-    num_workers: int = 8,
-    qsize: int = 20,
-    retryes: int = 1,
-    verbose:bool=False,
-    target_https:bool=True
+    path: str|None, manual_hosts: List[str]|None, logger: Logger,
+    payload: dict|None, timeout_val: int = 3, action: str = "get",
+    batch_size: int = 5, num_workers: int = 8, qsize: int = 20,
+    retryes: int = 1, verbose:bool=False, target_https:bool=True,
+    not_quiet: bool = False, headers: dict[str, str]|None = None, cookies: dict[str, str]|None = None,
+    bearer: str|None = None, cli_pass: bool = False, file_pass: str|None = None,
+    login: str|None = None, force: bool = False, debug_trace: Log_DebugTrace|None = None
 ):
-    if logger is None:
-        logger = Logger()
-    
     queue: asyncio.Queue = asyncio.Queue(maxsize=qsize)
     loop = asyncio.get_running_loop()
 
@@ -323,41 +408,77 @@ async def run_requester(
         fut.result()
 
     conn_limit = num_workers + 20 
-    connector = TCPConnector(limit=conn_limit, force_close=True)
+    
+    ctx = mp_get_context("spawn")
+    max_proc = min(max(1, (os.cpu_count() or 1)), max(1, num_workers))
+    proc_executor = ProcessPoolExecutor(max_workers=max_proc, mp_context=ctx)
+    in_flight: List[asyncio.Future] = []
+    none_count = 0
+    new_worker_id = 0
 
-    timeout = ClientTimeout(total=timeout_val, connect=None, sock_connect=timeout_val, sock_read=timeout_val)
-    async with ClientSession(
-            connector=connector,
-            middlewares=middlewares,
-            trace_configs=[trace_config.trace], timeout=timeout) as session:
-        async def worker(worker_id: int):
-            logger.log(f"worker {worker_id} started", LogLevel.debug)
-            processed = 0
-            while True:
-                batch = await queue.get()
-                try:
-                    if batch is None:
+    try:
+        producer_task = asyncio.create_task(asyncio.to_thread(_produce_batches_sync, path, manual_hosts, batch_size, 
+                                                              _queue_put, num_workers))
+
+        logger.log("Dispatcher started", LogLevel.info)
+
+        while True:
+            batch = await queue.get()
+            try:
+                if batch is None:
+                    none_count += 1
+                    if none_count >= num_workers:
                         break
-                    coros = list()
-                    url:str
-                    for url in batch:
-                        url = url.strip()
-                        if not url:
-                            continue
-                        if target_https:
-                            trace_config.star_vars[url].is_https = True
-                        coros.append(fetch_and_process(session, trace_config.star_vars[url], url, logger, action, timeout, payload, retryes, verbose))
-                        processed += 1
-                    await asyncio.gather(*coros, return_exceptions=True)
-                    
-                finally:
-                    queue.task_done()
-            logger.log(f"worker {worker_id} finished, processed={processed}", LogLevel.debug)
+                    else:
+                        continue
 
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(asyncio.to_thread(_produce_batches_sync, path, manual_hosts, batch_size, _queue_put, num_workers))
-            for i in range(num_workers):
-                tg.create_task(worker(i))
+                fut = loop.run_in_executor(
+                    proc_executor,
+                    _process_batch_in_subprocess,
+                    batch, action, payload, timeout_val, conn_limit, new_worker_id, 
+                    target_https, retryes, verbose, headers, cookies, bearer, cli_pass, file_pass, login, force
+                )
+                in_flight.append(fut)
+                new_worker_id += 1
+
+                if len(in_flight) >= max_proc:
+                    done, pending = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+                    for d in done:
+                        try:
+                            await parse_log(await d, logger, (not not_quiet), debug_trace)
+                        except Exception as e:
+                            logger.log(f"Process execution error: {repr(e)}", LogLevel.err)
+                            continue
+                    in_flight = list(pending)
+            finally:
+                queue.task_done()
+
+        if in_flight:
+            done_all:List[List[str]|BaseException]
+            done_all = await asyncio.gather(*in_flight, return_exceptions=True)
+            for proc_res in done_all:
+                if isinstance(proc_res, Exception) or isinstance(proc_res, BaseException):
+                    logger.log(f"Process execution error: {repr(proc_res)}", LogLevel.err)
+                else:
+                    try:
+                        await parse_log(proc_res, logger, (not not_quiet), debug_trace)
+                    except Exception as e:
+                        logger.log(f"Process execution error: {repr(e)}", LogLevel.err)
+                        continue
+
+        await producer_task
+
+    finally:
+        try:
+            await queue.join()
+        except Exception:
+            pass
+        try:
+            proc_executor.shutdown(wait=True)
+        except Exception:
+            proc_executor.shutdown(wait=False)
+
+    logger.log("Dispatcher finished", LogLevel.info)
 
     await queue.join()
 
@@ -379,7 +500,6 @@ def valid_headers_cookies_data(data):
     return 1
 
 def check_cli_arg(args, logger: Logger):
-    middlewares = list()
     if args.file and args.host:
         raise RuntimeError("Only one of the keys can be specified at a time –F or -H")
     elif not args.file and not args.host:
@@ -391,7 +511,6 @@ def check_cli_arg(args, logger: Logger):
             data = json.loads(args.headers)
             if not valid_headers_cookies_data(data):
                 raise RuntimeError("headers invalid")
-            middlewares.append(headers_middleware(data))
         except json.JSONDecodeError as e:
             raise RuntimeError("headers invalid")
     if args.cookies:
@@ -399,23 +518,13 @@ def check_cli_arg(args, logger: Logger):
             data = json.loads(args.cookies)
             if not valid_headers_cookies_data(data):
                 raise RuntimeError("cookies invalid")
-            middlewares.append(cookies_middleware(data))
         except json.JSONDecodeError as e:
             raise RuntimeError("cookies invalid")
-    if args.bearer:
-        try:
-            middlewares.append(bearer_auth_middleware(args.bearer))
-        except json.JSONDecodeError as e:
-            raise RuntimeError("bearer invalid")
     elif args.cli_pass:
-        if args.login:
-            middlewares.append(pass_auth_middleware(args.login, None, logger))
-        else:
+        if not args.login:
             raise RuntimeError("cli_pass is specified, but no login is specified")
     elif args.file_pass:
-        if args.login:
-            middlewares.append(pass_auth_middleware(args.login, Path(args.file_pass), logger, args.force))
-        else:
+        if not args.login:
             raise RuntimeError("file_pass is specified, but no login is specified")
 
     if args.action:
@@ -433,11 +542,10 @@ def check_cli_arg(args, logger: Logger):
     if args.timeout < 1:
         raise RuntimeError("timeout cannot be less than 1")
         
-    return middlewares
 
 def init_args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="CLI for testing server availability over the HTTP protocol")
-    parser.add_argument("--host", "-H", type=str, help="The host that the requests will be made to. Can specified multiple addresses separated by commas without spaces. Only one of the keys can be specified at a time –F or -H")
+    parser.add_argument("--host", "-H", type=str, action='append', help="The host that the requests will be made to. Can specified multiple addresses separated by commas without spaces. Only one of the keys can be specified at a time –F or -H")
     parser.add_argument("--timeout", "-t", type=int, default=3, help="Timeout sec, default 3 sec")
     parser.add_argument("--count", "-C", type=int, default=1, help="The сount of requests that will be sent to each host to calculate the average value, default 1")
     parser.add_argument("--file", "-F", type=str, help="A file with a list of addresses divided into lines. Only one of the keys can be specified at a time –F or -H")
@@ -472,16 +580,12 @@ def main() -> int:
     logger.init()
 
     try:
-        middlewares = check_cli_arg(args=args, logger=logger)
+        check_cli_arg(args=args, logger=logger)
     except Exception as e:
         logger.log(f"Parameters are incorrect: '{str(e)}'", LogLevel.fatal)
         return 1
 
-    debug_trace = DebugTrace(logger)
-    debug_trace.init_trace()
-
-    middlewares = []
-    manual_hosts = None
+    manual_hosts = []
     target_https = True
     if args.http:
         target_https = False
@@ -489,7 +593,8 @@ def main() -> int:
     total_urls = 0
     
     if args.host:
-        manual_hosts = args.host.split(",")
+        for item in args.host:
+            manual_hosts.extend(item.split(","))
         total_urls = len(manual_hosts)
     elif args.file:
         total_urls = count_lines(args.file, logger)
@@ -510,8 +615,6 @@ def main() -> int:
     asyncio.run(run_requester(
         path=args.file,
         manual_hosts=manual_hosts,
-        middlewares=middlewares,
-        trace_config=debug_trace,
         logger=logger,
         timeout_val=args.timeout,
         payload=args.payload,
@@ -521,7 +624,15 @@ def main() -> int:
         batch_size=BATCH_SIZE,
         qsize=int(calculated_workers//0.8),
         verbose=args.verbose,
-        target_https=target_https
+        target_https=target_https,
+        not_quiet=args.not_quiet,
+        headers=args.headers,
+        cookies=args.cookies,
+        bearer=args.bearer,
+        cli_pass=args.cli_pass,
+        file_pass=args.file_pass,
+        login=args.login,
+        force=args.force
     ))
     
     logger.close()
