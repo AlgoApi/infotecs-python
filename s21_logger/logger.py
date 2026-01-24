@@ -34,6 +34,7 @@ class Logger:
             try:
                 self.stdout = open(out, "a", encoding="utf-8", errors="replace")
             except FileNotFoundError:
+                # create new
                 temp = open(out, "w", encoding="utf-8", errors="replace")
                 temp.close()
                 del temp
@@ -48,6 +49,7 @@ class Logger:
 
     def close(self):
         if self.file:
+            # notice for user
             print("result written on file")
             self.stdout.close()
     
@@ -91,7 +93,7 @@ class Logger:
 
     def log_exception(self, exc_type, exc_value, exc_tb, status: LogLevel = LogLevel.err) -> None:
         short, full_tb = self._format_exc_summary(exc_type, exc_value, exc_tb)
-        header = f"{__name__} {self._now()} - {status} - Uncaught exception: {short}"
+        header = f"{self._now()} {__name__} - {status} - Uncaught exception: {short}"
         self.stdout.write(header + "\n")
         if self.verbose:
             self.stdout.write(full_tb)

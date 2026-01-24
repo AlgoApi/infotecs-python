@@ -23,11 +23,14 @@ BATCH_SIZE = 50
 @dataclass
 class RequestStats:
     url: str = field(default_factory=str)
+    # total registrated stats
     total: int = field(default_factory=int)
     errors: int = field(default_factory=int)
+    # total registrated http code -> code: count
     by_status: Dict[int, int] = field(default_factory=lambda: defaultdict(int))
     durations: List[float] = field(default_factory=list)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # is what to substitute if it is not specified in hosts
     is_https: bool = field(default_factory=bool)
 
     async def add(self, status: int, duration: float):
@@ -46,6 +49,7 @@ class RequestStats:
 class DebugTrace():
     def __init__(self, logger_obj: Logger) -> None:
         self.logger: Logger = logger_obj
+        # stats for worker -> "worker {id} - {url}"
         self.star_vars: Dict[str, RequestStats] = defaultdict(RequestStats)
         self.trace = TraceConfig()
 
@@ -124,6 +128,7 @@ def bearer_auth_middleware(token):
         return await handler(request)
     return middleware
 
+# wipe func for bytearray data in security reasons
 def _wipe_data(data: bytearray) -> None:
     if data:
         for i in range(len(data)):
@@ -136,9 +141,11 @@ def pass_auth_middleware(login:str, pass_path: Path|None, logger:Logger, force:b
                 password_ba = bytearray(f.read().strip())
                 middleware = DigestAuthMiddleware(login="user", password=password_ba.decode("utf-8"))
                 _wipe_data(password_ba)
+                # reducing the password lifetime on my side as much as possible
                 gc.collect()
             return middleware
-
+        
+        # require secure file access settings for security purposes.
         if platform.system() != "Windows":
             st = os.stat(pass_path)
             mode = oct(st.st_mode & 0o777)
@@ -208,6 +215,7 @@ async def fetch_and_process(session: ClientSession,
                 except Exception:
                     logger.log(f"binary response for {url}", LogLevel.debug)
         except (InvalidURL, NonHttpUrlClientError) as e:
+            # trying to fix a user error
             logger.log(f"Invalid URL: {repr(e) if verbose else ""} for {url}", LogLevel.err)
             if (("https://" if stats.is_https else "http://") not in url):
                 logger.log(f"'{"https://" if stats.is_https else "http://"}' part is missing, auto fixed, +1 retry: {repr(e) if verbose else ""} for {url}", LogLevel.err)
@@ -250,7 +258,10 @@ async def fetch_and_process(session: ClientSession,
             stats.errors += 1
         except TimeoutError:
             logger.log(f"Timeout for {url}", LogLevel.err)
-            await stats.add(504, timeout.total) # pyright: ignore[reportArgumentType] timeout.total cannot be None
+            if timeout.total:
+                await stats.add(504, timeout.total)
+            else:
+                logger.log(f"Timeout for {url}, but not known about timeout size", LogLevel.fatal)
             stats.errors += 1
         except ClientError as e:
             logger.log(f"Unexpected error: {repr(e) if verbose else ""} for {url}", LogLevel.err)
@@ -283,7 +294,7 @@ def _produce_batches_sync(path: str|None, items: list[str]|None, batch_size: int
             if not batch:
                 break
             queue_put(batch)
-
+        # stop markers
         for _ in range(num_workers):
             queue_put(None)
     elif path is not None:
@@ -293,6 +304,7 @@ def _produce_batches_sync(path: str|None, items: list[str]|None, batch_size: int
                 if not batch:
                     break
                 queue_put([ln.rstrip("\n") for ln in batch])
+        # stop markers
         for _ in range(num_workers):
             queue_put(None)
 
@@ -318,6 +330,7 @@ async def run_requester(
     queue: asyncio.Queue = asyncio.Queue(maxsize=qsize)
     loop = asyncio.get_running_loop()
 
+    # redirecting the eventloop to avoid self-lock
     def _queue_put(item):
         fut = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
         fut.result()
@@ -354,6 +367,7 @@ async def run_requester(
                     queue.task_done()
             logger.log(f"worker {worker_id} finished, processed={processed}", LogLevel.debug)
 
+        # ensuring that all workers are eventually closed
         async with asyncio.TaskGroup() as tg:
             tg.create_task(asyncio.to_thread(_produce_batches_sync, path, manual_hosts, batch_size, _queue_put, num_workers))
             for i in range(num_workers):
@@ -365,6 +379,7 @@ def count_lines(filepath: str, logger: Logger) -> int:
     try:
         with open(filepath, "rb") as f:
             num_lines = 0
+            # 1Mb
             while chunk := f.read(1024 * 1024):
                 num_lines += chunk.count(b'\n')
             return num_lines
@@ -437,7 +452,7 @@ def check_cli_arg(args, logger: Logger):
 
 def init_args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="CLI for testing server availability over the HTTP protocol")
-    parser.add_argument("--host", "-H", type=str, help="The host that the requests will be made to. Can specified multiple addresses separated by commas without spaces. Only one of the keys can be specified at a time –F or -H")
+    parser.add_argument("--host", "-H", type=str, action='append', help="The host that the requests will be made to. Can specified multiple addresses separated by commas without spaces. Only one of the keys can be specified at a time –F or -H")
     parser.add_argument("--timeout", "-t", type=int, default=3, help="Timeout sec, default 3 sec")
     parser.add_argument("--count", "-C", type=int, default=1, help="The сount of requests that will be sent to each host to calculate the average value, default 1")
     parser.add_argument("--file", "-F", type=str, help="A file with a list of addresses divided into lines. Only one of the keys can be specified at a time –F or -H")
@@ -481,7 +496,7 @@ def main() -> int:
     debug_trace.init_trace()
 
     middlewares = []
-    manual_hosts = None
+    manual_hosts = []
     target_https = True
     if args.http:
         target_https = False
@@ -489,7 +504,8 @@ def main() -> int:
     total_urls = 0
     
     if args.host:
-        manual_hosts = args.host.split(",")
+        for item in args.host:
+            manual_hosts.extend(item.split(","))
         total_urls = len(manual_hosts)
     elif args.file:
         total_urls = count_lines(args.file, logger)
@@ -519,7 +535,7 @@ def main() -> int:
         retryes=args.count,
         num_workers=calculated_workers,
         batch_size=BATCH_SIZE,
-        qsize=int(calculated_workers//0.8),
+        qsize=int(calculated_workers//0.8), # dividing to get a little more qsize from calculated_workers
         verbose=args.verbose,
         target_https=target_https
     ))
@@ -532,5 +548,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     status = main()
+    #so that the user doesn't think that nothing has happened.
     print(f"bye bye: {status}")
     
