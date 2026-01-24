@@ -21,16 +21,19 @@ from multiprocessing import get_context as mp_get_context
 import os
 
 MAX_WORKERS_LIMIT = 100
-BATCH_SIZE = 2
+BATCH_SIZE = 50
 
 @dataclass
 class RequestStats:
     url: str = field(default_factory=str)
+    # total registrated stats
     total: int = field(default_factory=int)
     errors: int = field(default_factory=int)
+    # total registrated http code -> code: count
     by_status: Dict[int, int] = field(default_factory=lambda: defaultdict(int))
     durations: List[float] = field(default_factory=list)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # is what to substitute if it is not specified in hosts
     is_https: bool = field(default_factory=bool)
 
     async def add(self, status: int, duration: float):
@@ -46,6 +49,7 @@ class RequestStats:
     def get_max(self) -> float:
         return max(self.durations) if self.durations else 0.0
 
+# A class that stores a debug trace for logs if there is a problem with the processes
 @dataclass
 class Log_DebugTrace():
     log_buf: list[str] = field(default_factory=list)
@@ -61,6 +65,7 @@ class Log_DebugTrace():
 class DebugTrace():
     def __init__(self, logger_obj: Logger) -> None:
         self.logger: Logger = logger_obj
+        # stats for worker -> "worker {id} - {url}"
         self.star_vars: Dict[str, RequestStats] = defaultdict(RequestStats)
         self.trace = TraceConfig()
 
@@ -139,6 +144,7 @@ def bearer_auth_middleware(token):
         return await handler(request)
     return middleware
 
+# wipe func for bytearray data in security reasons
 def _wipe_data(data: bytearray) -> None:
     if data:
         for i in range(len(data)):
@@ -151,9 +157,11 @@ def pass_auth_middleware(login:str, pass_path: Path|None, logger:Logger, force:b
                 password_ba = bytearray(f.read().strip())
                 middleware = DigestAuthMiddleware(login="user", password=password_ba.decode("utf-8"))
                 _wipe_data(password_ba)
+                # reducing the password lifetime on my side as much as possible
                 gc.collect()
             return middleware
 
+        # require secure file access settings for security purposes
         if platform.system() != "Windows":
             st = os.stat(pass_path)
             mode = oct(st.st_mode & 0o777)
@@ -223,6 +231,7 @@ async def fetch_and_process(session: ClientSession,
                 except Exception:
                     logger.log(f"binary response for {url}", LogLevel.debug)
         except (InvalidURL, NonHttpUrlClientError) as e:
+            # trying to fix a user error
             logger.log(f"Invalid URL: {repr(e) if verbose else ""} for {url}", LogLevel.err)
             if (("https://" if stats.is_https else "http://") not in url):
                 logger.log(f"'{"https://" if stats.is_https else "http://"}' part is missing, auto fixed, +1 retry: {repr(e) if verbose else ""} for {url}", LogLevel.err)
@@ -265,7 +274,10 @@ async def fetch_and_process(session: ClientSession,
             stats.errors += 1
         except TimeoutError:
             logger.log(f"Timeout for {url}", LogLevel.err)
-            await stats.add(504, timeout.total) # pyright: ignore[reportArgumentType] timeout.total cannot be None
+            if timeout.total:
+                await stats.add(504, timeout.total)
+            else:
+                logger.log(f"Timeout for {url}, but not known about timeout size", LogLevel.fatal)
             stats.errors += 1
         except ClientError as e:
             logger.log(f"Unexpected error: {repr(e) if verbose else ""} for {url}", LogLevel.err)
@@ -300,7 +312,7 @@ def _produce_batches_sync(path: str|None, items: list[str]|None,
             if not batch:
                 break
             queue_put(batch)
-
+        # stop markers
         for _ in range(num_workers):
             queue_put(None)
     elif path is not None:
@@ -310,6 +322,7 @@ def _produce_batches_sync(path: str|None, items: list[str]|None,
                 if not batch:
                     break
                 queue_put([ln.rstrip("\n") for ln in batch])
+        # stop markers
         for _ in range(num_workers):
             queue_put(None)
 
@@ -319,6 +332,7 @@ def _process_batch_in_subprocess(batch: list, action: str, payload: dict | None,
                                  headers: dict[str, str]|None = None, cookies: dict[str, str]|None = None,
                                  bearer: str|None = None, cli_pass: bool = False, file_pass: str|None = None,
                                  login: str|None = None, force: bool = False) -> List[str]:
+    # Due to the fact that all objects for the worker must be picklable, we trick the logger to write to a variable so that it can then be passed to the parent, who can parse and output
     _buf: List[str] = []
 
     class _BufferWriter:
@@ -332,6 +346,7 @@ def _process_batch_in_subprocess(batch: list, action: str, payload: dict | None,
         connector = TCPConnector(limit=conn_limit, force_close=True)
         timeout = ClientTimeout(total=timeout_val, connect=None, sock_connect=timeout_val, sock_read=timeout_val)
         
+        # Due to the fact that all objects for the worker must be picklable, we collect all the objects for the worker here and, unfortunately, they are the same for each worker (we lose a little in performance)
         middlewares = list()
         if headers:
             middlewares.append(headers_middleware(headers))
@@ -358,8 +373,8 @@ def _process_batch_in_subprocess(batch: list, action: str, payload: dict | None,
                 if not url:
                     continue
                 if target_https:
-                    trace_config.star_vars[f"worker-{worker_id}{url}"].is_https = True
-                coros.append(fetch_and_process(session, trace_config.star_vars[f"worker-{worker_id}{url}"], url, logger, action, timeout, payload, retryes, verbose))
+                    trace_config.star_vars[f"worker-{worker_id} - {url}"].is_https = True
+                coros.append(fetch_and_process(session, trace_config.star_vars[f"worker-{worker_id} - {url}"], url, logger, action, timeout, payload, retryes, verbose))
                 processed += 1
             await asyncio.gather(*coros, return_exceptions=True)
             logger.log(f"worker {worker_id} finished, processed={processed}", LogLevel.debug)
@@ -403,12 +418,14 @@ async def run_requester(
     queue: asyncio.Queue = asyncio.Queue(maxsize=qsize)
     loop = asyncio.get_running_loop()
 
+    # redirecting the eventloop to avoid self-lock
     def _queue_put(item):
         fut = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
         fut.result()
 
     conn_limit = num_workers + 20 
     
+    # spawn is more fault resistant
     ctx = mp_get_context("spawn")
     max_proc = min(max(1, (os.cpu_count() or 1)), max(1, num_workers))
     proc_executor = ProcessPoolExecutor(max_workers=max_proc, mp_context=ctx)
@@ -423,6 +440,7 @@ async def run_requester(
         logger.log("Dispatcher started", LogLevel.info)
 
         while True:
+            # we immediately take the data for the worker for picklable
             batch = await queue.get()
             try:
                 if batch is None:
@@ -441,8 +459,11 @@ async def run_requester(
                 in_flight.append(fut)
                 new_worker_id += 1
 
+                # if more than or equal to the number of available capacities has already been launched
                 if len(in_flight) >= max_proc:
+                    # then we wait for the first completed worker and immediately output its result
                     done, pending = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+                    # transferring the process logs to a centralized logger
                     for d in done:
                         try:
                             await parse_log(await d, logger, (not not_quiet), debug_trace)
@@ -455,7 +476,9 @@ async def run_requester(
 
         if in_flight:
             done_all:List[List[str]|BaseException]
+            # We are waiting for everything to be completed
             done_all = await asyncio.gather(*in_flight, return_exceptions=True)
+            # transferring the process logs to a centralized logger
             for proc_res in done_all:
                 if isinstance(proc_res, Exception) or isinstance(proc_res, BaseException):
                     logger.log(f"Process execution error: {repr(proc_res)}", LogLevel.err)
@@ -469,6 +492,7 @@ async def run_requester(
         await producer_task
 
     finally:
+        # ensuring that all workers are eventually closed
         try:
             await queue.join()
         except Exception:
@@ -486,6 +510,7 @@ def count_lines(filepath: str, logger: Logger) -> int:
     try:
         with open(filepath, "rb") as f:
             num_lines = 0
+            # 1Mb
             while chunk := f.read(1024 * 1024):
                 num_lines += chunk.count(b'\n')
             return num_lines
@@ -622,7 +647,7 @@ def main() -> int:
         retryes=args.count,
         num_workers=calculated_workers,
         batch_size=BATCH_SIZE,
-        qsize=int(calculated_workers//0.8),
+        qsize=int(calculated_workers//0.8), # dividing to get a little more qsize from calculated_workers
         verbose=args.verbose,
         target_https=target_https,
         not_quiet=args.not_quiet,
