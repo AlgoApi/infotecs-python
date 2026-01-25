@@ -102,7 +102,7 @@ python bench.py -F urls.txt -O report.txt
 
 **4. Указание тела, заголовков и куки данных запроса:**
 ```bash
-python bench.py -F urls.txt -O report.txt -p {"somedata": 123} -d {"somedata": "123"} -k {"somedata": "123"}
+python bench.py -F urls.txt -O report.txt -p '{"somedata": 123}' -d '{"somedata": "123"}' -k '{"somedata": "123"}'
 ```
 
 ### 📌 Формат вывода статистики
