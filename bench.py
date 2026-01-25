@@ -369,7 +369,7 @@ def _process_batch_in_subprocess(batch: list, action: str, payload: dict | None,
                 if not url:
                     continue
                 if target_https:
-                    trace_config.star_vars[f"worker-{worker_id} - {url}"].is_https = True
+                    trace_config.star_vars[f"worker-{worker_id} - {url} - {processed}"].is_https = True
                 coros.append(fetch_and_process(session, trace_config.star_vars[f"worker-{worker_id} - {url} - {processed}"], url, logger, action, timeout, payload, retryes, verbose))
                 processed += 1
             await asyncio.gather(*coros, return_exceptions=True)
