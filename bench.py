@@ -330,7 +330,7 @@ async def run_requester(
     queue: asyncio.Queue = asyncio.Queue(maxsize=qsize)
     loop = asyncio.get_running_loop()
 
-    # redirecting the eventloop to avoid self-lock
+    # async run safely in the event loop from another sync thread 
     def _queue_put(item):
         fut = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
         fut.result()
@@ -393,7 +393,7 @@ def valid_headers_cookies_data(data):
             return 0
     return 1
 
-def check_cli_arg(args, logger: Logger):
+def check_cli_arg_middlewares(args, logger: Logger):
     middlewares = list()
     if args.file and args.host:
         raise RuntimeError("Only one of the keys can be specified at a time –F or -H")
@@ -487,7 +487,7 @@ def main() -> int:
     logger.init()
 
     try:
-        middlewares = check_cli_arg(args=args, logger=logger)
+        middlewares = check_cli_arg_middlewares(args=args, logger=logger)
     except Exception as e:
         logger.log(f"Parameters are incorrect: '{str(e)}'", LogLevel.fatal)
         return 1
