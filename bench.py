@@ -244,9 +244,6 @@ async def fetch_and_process(session: ClientSession,
         except ServerDisconnectedError as e:
             logger.log(f"The server terminated the connection: {repr(e) if verbose else ""} for {url}", LogLevel.err)
             stats.errors += 1
-        except ServerTimeoutError as e:
-            logger.log(f"Server or socket timeout for {url}", LogLevel.err)
-            stats.errors += 1
         except ClientResponseError as e:
             logger.log(f"HTTP error {e.status} for {url}", LogLevel.err)
             stats.errors += 1
@@ -262,7 +259,6 @@ async def fetch_and_process(session: ClientSession,
                 await stats.add(504, timeout.total)
             else:
                 logger.log(f"Timeout for {url}, but not known about timeout size", LogLevel.fatal)
-            stats.errors += 1
         except ClientError as e:
             logger.log(f"Unexpected error: {repr(e) if verbose else ""} for {url}", LogLevel.err)
             stats.errors += 1
@@ -358,8 +354,8 @@ async def run_requester(
                         if not url:
                             continue
                         if target_https:
-                            trace_config.star_vars[f"worker-{worker_id} - {url}"].is_https = True
-                        coros.append(fetch_and_process(session, trace_config.star_vars[f"worker-{worker_id} - {url}"], url, logger, action, timeout, payload, retryes, verbose))
+                            trace_config.star_vars[f"worker-{worker_id} - {url} - {processed}"].is_https = True
+                        coros.append(fetch_and_process(session, trace_config.star_vars[f"worker-{worker_id} - {url} - {processed}"], url, logger, action, timeout, payload, retryes, verbose))
                         processed += 1
                     await asyncio.gather(*coros, return_exceptions=True)
                     
@@ -403,18 +399,18 @@ def check_cli_arg_middlewares(args, logger: Logger):
 
     if args.headers:
         try:
-            data = json.loads(args.headers)
-            if not valid_headers_cookies_data(data):
+            args.headers = json.loads(args.headers)
+            if not valid_headers_cookies_data(args.headers):
                 raise RuntimeError("headers invalid")
-            middlewares.append(headers_middleware(data))
+            middlewares.append(headers_middleware(args.headers))
         except json.JSONDecodeError as e:
             raise RuntimeError("headers invalid")
     if args.cookies:
         try:
-            data = json.loads(args.cookies)
-            if not valid_headers_cookies_data(data):
+            args.headers = json.loads(args.cookies)
+            if not valid_headers_cookies_data(args.headers):
                 raise RuntimeError("cookies invalid")
-            middlewares.append(cookies_middleware(data))
+            middlewares.append(cookies_middleware(args.headers))
         except json.JSONDecodeError as e:
             raise RuntimeError("cookies invalid")
     if args.bearer:
@@ -508,6 +504,7 @@ def main() -> int:
             manual_hosts.extend(item.split(","))
         total_urls = len(manual_hosts)
     elif args.file:
+        manual_hosts = None
         total_urls = count_lines(args.file, logger)
     
     calculated_workers = 0
