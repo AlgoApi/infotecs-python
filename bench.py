@@ -260,9 +260,6 @@ async def fetch_and_process(session: ClientSession,
         except ServerDisconnectedError as e:
             logger.log(f"The server terminated the connection: {repr(e) if verbose else ""} for {url}", LogLevel.err)
             stats.errors += 1
-        except ServerTimeoutError as e:
-            logger.log(f"Server or socket timeout for {url}", LogLevel.err)
-            stats.errors += 1
         except ClientResponseError as e:
             logger.log(f"HTTP error {e.status} for {url}", LogLevel.err)
             stats.errors += 1
