@@ -127,6 +127,7 @@ python bench.py -F urls.txt -O report.txt -p '{"somedata": 123}' -d '{"somedata"
     Max=1.0697
     Avg=1.0697
 }
+```
 
 ## 🏗️ Внутреннее устройство утилиты
 
